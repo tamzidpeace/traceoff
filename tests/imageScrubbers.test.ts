@@ -421,7 +421,9 @@ describe('bakeOrientedImageCanvas', () => {
         expect(kind).toBe('2d');
         return { drawImage: drawImageSpy };
       }
-      convertToBlob = convertToBlobSpy;
+      convertToBlob(opts?: ImageEncodeOptions) {
+        return convertToBlobSpy(opts);
+      }
     }
 
     vi.stubGlobal('createImageBitmap', createImageBitmapSpy);
@@ -486,5 +488,65 @@ describe('bakeOrientedImageCanvas', () => {
     expect(toBlobSpy).toHaveBeenCalledTimes(1);
     expect(closeSpy).toHaveBeenCalledTimes(1);
     expect(result).toEqual(cleanOutputJpeg);
+  });
+
+  it('skips OffscreenCanvas allocation when OffscreenCanvas.prototype.convertToBlob is missing and falls back when 2D context is null', async () => {
+    const cleanOutputJpeg = buildJpegWithExif({});
+    const closeSpy = vi.fn();
+    const domDrawImageSpy = vi.fn();
+    const toBlobSpy = vi.fn((cb: (blob: Blob | null) => void) => {
+      cb(new Blob([new Uint8Array(cleanOutputJpeg)], { type: 'image/jpeg' }));
+    });
+    const mockCanvas = {
+      width: 0,
+      height: 0,
+      getContext: vi.fn(() => ({ drawImage: domDrawImageSpy })),
+      toBlob: toBlobSpy,
+    };
+
+    const origCreateElement = document.createElement.bind(document);
+    vi.spyOn(document, 'createElement').mockImplementation((tagName: string) => {
+      if (tagName === 'canvas') {
+        return mockCanvas as unknown as HTMLCanvasElement;
+      }
+      return origCreateElement(tagName);
+    });
+
+    vi.stubGlobal(
+      'createImageBitmap',
+      vi.fn().mockResolvedValue({ width: 3, height: 2, close: closeSpy })
+    );
+
+    // 1. OffscreenCanvas exists but prototype.convertToBlob is missing -> never constructs OffscreenCanvas
+    const offscreenCtorSpy = vi.fn();
+    class NoConvertToBlobOffscreenCanvas {
+      constructor(width: number, height: number) {
+        offscreenCtorSpy(width, height);
+      }
+      getContext() {
+        return { drawImage: vi.fn() };
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', NoConvertToBlobOffscreenCanvas);
+
+    const input = buildJpegWithExif({ orientation: 6 });
+    const res1 = await bakeOrientedImageCanvas(input, 'image/jpeg');
+    expect(offscreenCtorSpy).not.toHaveBeenCalled();
+    expect(res1).toEqual(cleanOutputJpeg);
+
+    // 2. OffscreenCanvas.prototype.convertToBlob exists but getContext('2d') returns null -> falls back to DOM canvas
+    class NullContextOffscreenCanvas {
+      getContext() {
+        return null;
+      }
+      convertToBlob() {
+        return Promise.resolve(new Blob());
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', NullContextOffscreenCanvas);
+
+    const res2 = await bakeOrientedImageCanvas(input, 'image/jpeg');
+    expect(domDrawImageSpy).toHaveBeenCalledTimes(2);
+    expect(res2).toEqual(cleanOutputJpeg);
   });
 });

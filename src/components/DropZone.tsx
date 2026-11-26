@@ -45,6 +45,7 @@ export function DropZone({ onFilesAdded }: DropZoneProps) {
 
   const handleDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
     setIsDragging(false);
   }, []);
 

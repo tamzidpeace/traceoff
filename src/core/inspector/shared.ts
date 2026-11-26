@@ -13,10 +13,11 @@ export function classifyMetadataKey(key: string): {
   category: MetadataCategory;
   sensitive: boolean;
 } {
+  const baseKey = key.replace(/^[a-z0-9_-]+:/i, '');
   if (LOCATION_KEY_RE.test(key)) {
     return { category: 'location', sensitive: true };
   }
-  if (DEVICE_KEY_RE.test(key)) {
+  if (DEVICE_KEY_RE.test(baseKey)) {
     return { category: 'device', sensitive: true };
   }
   if (AUTHOR_KEY_RE.test(key)) {
@@ -25,7 +26,7 @@ export function classifyMetadataKey(key: string): {
   if (DATE_KEY_RE.test(key)) {
     return { category: 'dates', sensitive: true };
   }
-  const lower = key.toLowerCase();
+  const lower = baseKey.toLowerCase();
   const nonSensitiveTechnical =
     lower === 'orientation' ||
     lower === 'xresolution' ||
@@ -80,7 +81,7 @@ export function computeRiskLevel(hasGps: boolean, totalTags: number): RiskLevel 
   return 'clean';
 }
 
-const GPS_FIELD_KEY_RE = /(gps|latitude|longitude)/i;
+const GPS_FIELD_KEY_RE = /(latitude|longitude|gpsposition|gpscoordinates|gpsdest)/i;
 
 export function hasGpsField(fields: readonly MetadataField[]): boolean {
   return fields.some((field) => GPS_FIELD_KEY_RE.test(field.key));

@@ -680,4 +680,132 @@ describe('TraceOff App UI', () => {
     });
     expect(mockScrub).toHaveBeenCalledTimes(1);
   });
+
+  it('uses amber warning badge styling when after.totalTags > 0', async () => {
+    const beforeReport = makeJpegReport();
+    const partialAfter: MetadataReport = {
+      ...makeCleanReport('pdf'),
+      riskLevel: 'medium',
+      totalTags: 2,
+      fields: beforeReport.fields.slice(2, 4),
+    };
+
+    mockInspect.mockResolvedValueOnce(beforeReport);
+    mockScrub.mockResolvedValueOnce({
+      format: 'pdf',
+      cleanBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      mode: 'pdf-deep',
+      before: beforeReport,
+      after: partialAfter,
+      originalSize: 2000,
+      cleanSize: 1800,
+      warnings: [],
+    });
+
+    const { container } = render(<App />);
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [createTestFile('partial.pdf', 'application/pdf', '%PDF-1.7')] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('partial.pdf')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Scrub All Files/i }));
+
+    await waitFor(() => {
+      const badge = screen.getByText('2 tags remaining');
+      expect(badge).toBeInTheDocument();
+      expect(badge).toHaveClass('border-amber-500/30');
+      expect(badge).toHaveClass('bg-amber-500/15');
+      expect(badge).not.toHaveClass('border-emerald-500/30');
+    });
+  });
+
+  it('scrubs signed PDF via Scrub All immediately after toggling signedConfirmed checkbox', async () => {
+    const signedPdfReport: MetadataReport = {
+      format: 'pdf',
+      riskLevel: 'medium',
+      hasGps: false,
+      orientation: null,
+      hasIccProfile: false,
+      isSignedPdf: true,
+      embeddedImageWithMetaCount: 0,
+      totalTags: 1,
+      fields: [
+        {
+          key: 'Author',
+          label: 'Author',
+          value: 'Signer',
+          category: 'author',
+          sensitive: true,
+        },
+      ],
+    };
+
+    mockInspect.mockResolvedValueOnce(signedPdfReport);
+    mockScrub.mockResolvedValueOnce({
+      format: 'pdf',
+      cleanBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      mode: 'pdf-deep',
+      before: signedPdfReport,
+      after: makeCleanReport('pdf'),
+      originalSize: 3000,
+      cleanSize: 2500,
+      warnings: ['Cryptographic digital signatures in this PDF have been invalidated.'],
+    });
+
+    const { container } = render(<App />);
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [createTestFile('signed-checkbox.pdf', 'application/pdf', '%PDF-1.7')] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('signed-checkbox.pdf')).toBeInTheDocument();
+    });
+
+    const checkbox = screen.getByRole('checkbox', {
+      name: /I understand scrubbing will invalidate the digital signature/i,
+    });
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole('button', { name: /Scrub All Files/i }));
+
+    await waitFor(() => {
+      expect(mockScrub).toHaveBeenCalledWith(
+        expect.any(Uint8Array),
+        expect.objectContaining({ allowSignedPdfScrub: true })
+      );
+      expect(screen.getByText('Verified Clean: 0 tracking tags remaining')).toBeInTheDocument();
+    });
+  });
+
+  it('revokes previewUrl on inspection failure and when a disguised .jpg inspects as PDF', async () => {
+    mockInspect
+      .mockRejectedValueOnce(new Error('Corrupt image bytes'))
+      .mockResolvedValueOnce(makeCleanReport('pdf'));
+
+    const { container } = render(<App />);
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: {
+        files: [
+          createTestFile('corrupt.jpg', 'image/jpeg', 'not-really-jpg'),
+          createTestFile('disguised.jpg', 'image/jpeg', '%PDF-1.7'),
+        ],
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Corrupt image bytes')).toBeInTheDocument();
+      expect(screen.getByText('disguised.jpg')).toBeInTheDocument();
+    });
+
+    expect(createdUrls).toHaveLength(2);
+    expect(revokedUrls).toContain(createdUrls[0]);
+    expect(revokedUrls).toContain(createdUrls[1]);
+    expect(screen.queryByAltText('corrupt.jpg preview')).not.toBeInTheDocument();
+    expect(screen.queryByAltText('disguised.jpg preview')).not.toBeInTheDocument();
+  });
 });

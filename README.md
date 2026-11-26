@@ -90,7 +90,7 @@ npm run typecheck
 npm run build
 ```
 
-You can also click **Try sample photo** in the app to test metadata inspection and scrubbing immediately with the bundled sample JPEG (`public/samples/sample-photo.jpg`).
+You can also click **Try with Sample Photo** in the app to test metadata inspection and scrubbing immediately with the bundled sample JPEG (`public/samples/sample-photo.jpg`).
 
 ---
 

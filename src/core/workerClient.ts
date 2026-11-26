@@ -181,7 +181,12 @@ export class ScrubWorkerClient {
     return new Promise<MetadataReport>((resolve, reject) => {
       this.pending.set(id, { kind: 'inspect', resolve, reject });
       const request: WorkerRequest = { id, type: 'inspect', bytes };
-      worker.postMessage(request);
+      try {
+        worker.postMessage(request);
+      } catch (err) {
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -201,7 +206,12 @@ export class ScrubWorkerClient {
         reject,
       });
       const request: WorkerRequest = { id, type: 'scrub', bytes, options };
-      worker.postMessage(request);
+      try {
+        worker.postMessage(request);
+      } catch (err) {
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 

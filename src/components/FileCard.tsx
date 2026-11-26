@@ -136,8 +136,18 @@ export function FileCard({
 
               {item.status === 'scrubbed' && result && (
                 <>
-                  <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2.5 py-0.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300">
-                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span
+                    className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-xs font-semibold ${
+                      result.after.totalTags === 0
+                        ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                        : 'border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                    }`}
+                  >
+                    {result.after.totalTags === 0 ? (
+                      <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    ) : (
+                      <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+                    )}
                     {result.after.totalTags === 0
                       ? 'Verified Clean: 0 tracking tags remaining'
                       : `${result.after.totalTags} tags remaining`}

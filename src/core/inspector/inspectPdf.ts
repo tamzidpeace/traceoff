@@ -1,16 +1,23 @@
 import {
   decodePDFRawStream,
-  EncryptedPDFError,
   PDFArray,
   PDFDict,
   PDFDocument,
   PDFHexString,
   PDFName,
+  PDFObject,
   PDFRawStream,
   PDFRef,
   PDFStream,
   PDFString,
 } from 'pdf-lib';
+import {
+  detectDigitalSignature,
+  isSingleDctDecodeFilter,
+  isXObjectStream,
+  loadPdfDocument,
+  PdfInspectError,
+} from '../pdf/shared';
 import type { MetadataField, MetadataReport } from '../types';
 import { inspectImage } from './inspectImage';
 import {
@@ -22,17 +29,9 @@ import {
   hasGpsField,
 } from './shared';
 
+export { PdfInspectError };
+
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
-
-export class PdfInspectError extends Error {
-  readonly code: 'encrypted' | 'invalid';
-
-  constructor(code: 'encrypted' | 'invalid', message: string) {
-    super(message);
-    this.name = 'PdfInspectError';
-    this.code = code;
-  }
-}
 
 function decodePdfTextValue(obj: unknown): string {
   if (obj instanceof PDFString || obj instanceof PDFHexString) {
@@ -57,22 +56,6 @@ function decodeMetadataStream(stream: PDFStream): string {
   } catch {
     return '';
   }
-}
-
-function hasFilterName(dict: PDFDict, targetFilter: string): boolean {
-  const filter = dict.get(PDFName.of('Filter'));
-  if (filter instanceof PDFName) {
-    return filter === PDFName.of(targetFilter);
-  }
-  if (filter instanceof PDFArray) {
-    for (let i = 0; i < filter.size(); i++) {
-      const item = filter.get(i);
-      if (item instanceof PDFName && item === PDFName.of(targetFilter)) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 function inspectInfoDictionary(doc: PDFDocument, fields: MetadataField[]): void {
@@ -181,11 +164,20 @@ function inspectDictXmpAndPieceInfo(
 
 function inspectAnnotationDict(
   doc: PDFDocument,
-  annotDict: PDFDict,
+  annotItem: PDFObject | undefined,
   pageNumber: number,
   annotIndex: number,
-  fields: MetadataField[]
+  fields: MetadataField[],
+  visited: Set<PDFRef>
 ): void {
+  if (annotItem instanceof PDFRef) {
+    if (visited.has(annotItem)) return;
+    visited.add(annotItem);
+  }
+
+  const annotDict = doc.context.lookup(annotItem);
+  if (!(annotDict instanceof PDFDict)) return;
+
   const annotKeys: Array<{ pdfKey: string; label: string; category: MetadataField['category'] }> = [
     { pdfKey: 'T', label: 'Annotation Author', category: 'author' },
     { pdfKey: 'Subj', label: 'Annotation Subject', category: 'author' },
@@ -197,7 +189,11 @@ function inspectAnnotationDict(
   const ft = doc.context.lookup(annotDict.get(PDFName.of('FT')));
   if (ft === PDFName.of('Sig')) return;
 
+  const isWidget =
+    doc.context.lookup(annotDict.get(PDFName.of('Subtype'))) === PDFName.of('Widget');
+
   for (const spec of annotKeys) {
+    if (isWidget && spec.pdfKey === 'T') continue;
     const raw = doc.context.lookup(annotDict.get(PDFName.of(spec.pdfKey)));
     const val = decodePdfTextValue(raw);
     if (!val) continue;
@@ -210,97 +206,19 @@ function inspectAnnotationDict(
     });
   }
 
-  const popup = doc.context.lookup(annotDict.get(PDFName.of('Popup')));
-  if (popup instanceof PDFDict) {
-    inspectAnnotationDict(doc, popup, pageNumber, annotIndex, fields);
+  const popup = annotDict.get(PDFName.of('Popup'));
+  if (popup !== undefined) {
+    inspectAnnotationDict(doc, popup, pageNumber, annotIndex, fields, visited);
   }
-}
-
-function detectDigitalSignature(doc: PDFDocument): boolean {
-  const acroForm = doc.context.lookup(doc.catalog.get(PDFName.of('AcroForm')));
-  if (acroForm instanceof PDFDict) {
-    const fields = doc.context.lookup(acroForm.get(PDFName.of('Fields')));
-    if (fields instanceof PDFArray && hasSignatureField(doc, fields, new Set())) {
-      return true;
-    }
-  }
-
-  for (const [, obj] of doc.context.enumerateIndirectObjects()) {
-    if (obj instanceof PDFDict) {
-      const type = obj.get(PDFName.of('Type'));
-      const ft = obj.get(PDFName.of('FT'));
-      const byteRange = obj.get(PDFName.of('ByteRange'));
-      if (type === PDFName.of('Sig') || ft === PDFName.of('Sig') || byteRange !== undefined) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
-function hasSignatureField(
-  doc: PDFDocument,
-  fieldsArray: PDFArray,
-  visited: Set<PDFRef>
-): boolean {
-  for (let i = 0; i < fieldsArray.size(); i++) {
-    const item = fieldsArray.get(i);
-    if (item instanceof PDFRef) {
-      if (visited.has(item)) continue;
-      visited.add(item);
-    }
-    const dict = doc.context.lookup(item);
-    if (!(dict instanceof PDFDict)) continue;
-
-    if (
-      dict.get(PDFName.of('FT')) === PDFName.of('Sig') ||
-      dict.get(PDFName.of('ByteRange')) !== undefined
-    ) {
-      return true;
-    }
-
-    const v = doc.context.lookup(dict.get(PDFName.of('V')));
-    if (
-      v instanceof PDFDict &&
-      (v.get(PDFName.of('Type')) === PDFName.of('Sig') ||
-        v.get(PDFName.of('ByteRange')) !== undefined)
-    ) {
-      return true;
-    }
-
-    const kids = doc.context.lookup(dict.get(PDFName.of('Kids')));
-    if (kids instanceof PDFArray && hasSignatureField(doc, kids, visited)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
  * Deeply inspect a PDF document for Info dictionary entries, XMP /Metadata,
  * /PieceInfo, /Annots authors/dates, cryptographic signatures, and embedded
- * JPEG image XObjects. Throws PdfInspectError('encrypted', ...) on encrypted PDFs.
+ * XObjects (Image/Form). Throws PdfInspectError('encrypted', ...) on encrypted PDFs.
  */
 export async function inspectPdf(bytes: Uint8Array): Promise<MetadataReport> {
-  let doc: PDFDocument;
-  try {
-    doc = await PDFDocument.load(bytes, { updateMetadata: false });
-  } catch (err) {
-    if (
-      err instanceof EncryptedPDFError ||
-      (err instanceof Error && /encrypt/i.test(err.message))
-    ) {
-      throw new PdfInspectError(
-        'encrypted',
-        'This PDF is encrypted or password-protected and cannot be inspected or scrubbed in the browser.'
-      );
-    }
-    throw new PdfInspectError(
-      'invalid',
-      err instanceof Error ? `Invalid or corrupt PDF: ${err.message}` : 'Invalid or corrupt PDF'
-    );
-  }
+  const doc = await loadPdfDocument(bytes);
 
   const fields: MetadataField[] = [];
   let hasGps = false;
@@ -313,6 +231,7 @@ export async function inspectPdf(bytes: Uint8Array): Promise<MetadataReport> {
   inspectDictXmpAndPieceInfo(doc, doc.catalog, 'catalog', 'Document', fields);
 
   // 3. Page-level /Metadata, /PieceInfo, and /Annots
+  const visitedAnnotRefs = new Set<PDFRef>();
   const pages = doc.getPages();
   pages.forEach((page, pageIdx) => {
     const pageNum = pageIdx + 1;
@@ -327,10 +246,7 @@ export async function inspectPdf(bytes: Uint8Array): Promise<MetadataReport> {
     const annots = doc.context.lookup(page.node.get(PDFName.of('Annots')));
     if (annots instanceof PDFArray) {
       for (let i = 0; i < annots.size(); i++) {
-        const annot = doc.context.lookup(annots.get(i));
-        if (annot instanceof PDFDict) {
-          inspectAnnotationDict(doc, annot, pageNum, i + 1, fields);
-        }
+        inspectAnnotationDict(doc, annots.get(i), pageNum, i + 1, fields, visitedAnnotRefs);
       }
     }
   });
@@ -338,12 +254,24 @@ export async function inspectPdf(bytes: Uint8Array): Promise<MetadataReport> {
   // 4. Digital signatures
   const isSignedPdf = detectDigitalSignature(doc);
 
-  // 5. Embedded Image XObjects (/Subtype /Image)
+  // 5. Embedded XObjects (/Subtype /Image, /Subtype /Form, or /Type /XObject)
   let imageIndex = 0;
+  let xobjectIndex = 0;
   for (const [, obj] of doc.context.enumerateIndirectObjects()) {
-    if (!(obj instanceof PDFStream)) continue;
-    const subtype = obj.dict.get(PDFName.of('Subtype'));
-    if (subtype !== PDFName.of('Image')) continue;
+    if (!(obj instanceof PDFStream) || !isXObjectStream(doc, obj)) continue;
+
+    const subtype = doc.context.lookup(obj.dict.get(PDFName.of('Subtype')));
+    if (subtype !== PDFName.of('Image')) {
+      xobjectIndex++;
+      inspectDictXmpAndPieceInfo(
+        doc,
+        obj.dict,
+        `xobject:${xobjectIndex}`,
+        `Form XObject #${xobjectIndex}`,
+        fields
+      );
+      continue;
+    }
 
     imageIndex++;
     let imageHasMeta = inspectDictXmpAndPieceInfo(
@@ -355,7 +283,7 @@ export async function inspectPdf(bytes: Uint8Array): Promise<MetadataReport> {
       'pdf-embedded'
     );
 
-    if (obj instanceof PDFRawStream && hasFilterName(obj.dict, 'DCTDecode')) {
+    if (obj instanceof PDFRawStream && isSingleDctDecodeFilter(doc, obj.dict)) {
       const jpegBytes = obj.getContents();
       const imgReport = await inspectImage(jpegBytes, 'jpeg');
       if (imgReport.hasGps) {

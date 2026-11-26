@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { inspectImage } from '../src/core/inspector/inspectImage';
 import { inspectPdf, PdfInspectError } from '../src/core/inspector/inspectPdf';
+import { classifyMetadataKey, hasGpsField } from '../src/core/inspector/shared';
 import {
   buildJpegWithExif,
   buildMinimalExifTiff,
@@ -274,6 +275,37 @@ describe('inspectPdf', () => {
       webpReport.fields.some(
         (f) => f.key === 'xmp:dc:creator' && f.value === 'Tamzid Peace'
       )
+    ).toBe(true);
+  });
+});
+
+describe('metadata classification & GPS detection helpers', () => {
+  it('strips namespace prefix before matching device and non-sensitive technical keys', () => {
+    expect(classifyMetadataKey('tiff:Make')).toEqual({ category: 'device', sensitive: true });
+    expect(classifyMetadataKey('exif:LensModel')).toEqual({ category: 'device', sensitive: true });
+    expect(classifyMetadataKey('tiff:Orientation')).toEqual({
+      category: 'other',
+      sensitive: false,
+    });
+  });
+
+  it('does not flag GPSVersionID or GPSStatus as coordinate GPS leaks', () => {
+    expect(
+      hasGpsField([
+        { key: 'GPSVersionID', label: 'GPS Version ID', value: '2.3.0.0', category: 'location', sensitive: true },
+        { key: 'GPSStatus', label: 'GPS Status', value: 'A', category: 'location', sensitive: true },
+      ])
+    ).toBe(false);
+
+    expect(
+      hasGpsField([
+        { key: 'GPSLatitude', label: 'GPS Latitude', value: '23.8', category: 'location', sensitive: true },
+      ])
+    ).toBe(true);
+    expect(
+      hasGpsField([
+        { key: 'exif:GPSPosition', label: 'GPS Position', value: '23.8, 90.4', category: 'location', sensitive: true },
+      ])
     ).toBe(true);
   });
 });

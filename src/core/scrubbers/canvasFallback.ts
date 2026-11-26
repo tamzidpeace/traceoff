@@ -41,19 +41,22 @@ export async function bakeOrientedImageCanvas(
       throw new Error(`Decoded image has invalid dimensions (${width}x${height})`);
     }
 
-    if (typeof OffscreenCanvas !== 'undefined') {
+    if (
+      typeof OffscreenCanvas !== 'undefined' &&
+      typeof OffscreenCanvas.prototype?.convertToBlob === 'function'
+    ) {
       const offscreen = new OffscreenCanvas(width, height);
       const ctx = offscreen.getContext('2d');
-      if (!ctx) {
-        throw new Error('Failed to acquire 2D context from OffscreenCanvas');
-      }
-      ctx.drawImage(bitmap, 0, 0);
-      if (typeof offscreen.convertToBlob === 'function') {
+      if (ctx) {
+        ctx.drawImage(bitmap, 0, 0);
         const outBlob = await offscreen.convertToBlob({
           type: 'image/jpeg',
           quality: 0.95,
         });
         return await blobToUint8Array(outBlob);
+      }
+      if (typeof document === 'undefined') {
+        throw new Error('Failed to acquire 2D context from OffscreenCanvas');
       }
     }
 

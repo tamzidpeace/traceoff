@@ -150,15 +150,19 @@ describe('scrubPdfDeep', () => {
     expect(after.totalTags).toBe(0);
     expect(after.riskLevel).toBe('clean');
 
-    // Also verify scrubPdfDeep handles cyclic /Popup references safely without infinite recursion
+    // Also verify inspectPdf and scrubPdfDeep handle cyclic /Popup references safely without infinite recursion
     popupDict.set(PDFName.of('Popup'), parentRef);
     const cyclicBytes = await doc.save({ useObjectStreams: false });
+    const cyclicBefore = await inspectPdf(cyclicBytes);
+    expect(cyclicBefore.totalTags).toBeGreaterThan(0);
+
     const { cleanBytes: cleanCyclicBytes } = await scrubPdfDeep(cyclicBytes, {
       preserveIcc: true,
       allowSignedPdfScrub: false,
     });
     const cleanCyclicDoc = await PDFDocument.load(cleanCyclicBytes, { updateMetadata: false });
     expect(cleanCyclicDoc.getPageCount()).toBe(1);
+    expect((await inspectPdf(cleanCyclicBytes)).totalTags).toBe(0);
   });
 
   it('scrubs embedded /DCTDecode JPEG XObject EXIF/GPS/XMP while keeping PDF valid and visual attributes intact', async () => {
@@ -373,6 +377,10 @@ describe('scrubPdfDeep', () => {
 
     const pdfBytes = await doc.save({ useObjectStreams: false });
 
+    const before = await inspectPdf(pdfBytes);
+    expect(before.totalTags).toBeGreaterThan(0);
+    expect(before.fields.some((f) => f.value.includes('IllustratorUser'))).toBe(true);
+
     const { cleanBytes, warnings } = await scrubPdfDeep(pdfBytes, {
       preserveIcc: true,
       allowSignedPdfScrub: false,
@@ -397,5 +405,74 @@ describe('scrubPdfDeep', () => {
     expect(formStreams[0]!.dict.get(PDFName.of('Metadata'))).toBeUndefined();
     expect(formStreams[0]!.dict.get(PDFName.of('PieceInfo'))).toBeUndefined();
     expect(formStreams[0]!.dict.get(PDFName.of('BBox'))).toBeDefined();
+  });
+
+  it('preserves /T field name on /Subtype /Widget AcroForm annotations while clearing /Subj, /CreationDate, and /M', async () => {
+    const basePdf = await buildPdfWithDeepMeta({});
+    const doc = await PDFDocument.load(basePdf, { updateMetadata: false });
+    const page = doc.getPages()[0]!;
+
+    const widgetDict = PDFDict.withContext(doc.context);
+    widgetDict.set(PDFName.of('Type'), PDFName.of('Annot'));
+    widgetDict.set(PDFName.of('Subtype'), PDFName.of('Widget'));
+    widgetDict.set(PDFName.of('FT'), PDFName.of('Tx'));
+    widgetDict.set(PDFName.of('Rect'), doc.context.obj([10, 10, 110, 30]));
+    widgetDict.set(PDFName.of('T'), PDFString.of('ApplicantEmail'));
+    widgetDict.set(PDFName.of('Subj'), PDFString.of('WidgetSubject'));
+    widgetDict.set(PDFName.of('CreationDate'), PDFString.of('D:20260101000000Z'));
+    widgetDict.set(PDFName.of('M'), PDFString.of('D:20260102000000Z'));
+    const widgetRef = doc.context.register(widgetDict);
+
+    const annots = PDFArray.withContext(doc.context);
+    annots.push(widgetRef);
+    page.node.set(PDFName.of('Annots'), annots);
+
+    const pdfBytes = await doc.save({ useObjectStreams: false });
+
+    const before = await inspectPdf(pdfBytes);
+    expect(before.fields.some((f) => f.value === 'WidgetSubject')).toBe(true);
+    expect(before.fields.some((f) => f.value === 'ApplicantEmail')).toBe(false);
+
+    const { cleanBytes } = await scrubPdfDeep(pdfBytes, {
+      preserveIcc: true,
+      allowSignedPdfScrub: false,
+    });
+
+    const after = await inspectPdf(cleanBytes);
+    expect(after.totalTags).toBe(0);
+
+    const cleanDoc = await PDFDocument.load(cleanBytes, { updateMetadata: false });
+    const cleanAnnots = cleanDoc.context.lookup(cleanDoc.getPages()[0]!.node.get(PDFName.of('Annots'))) as PDFArray;
+    const cleanWidget = cleanDoc.context.lookup(cleanAnnots.get(0)) as PDFDict;
+    expect((cleanWidget.get(PDFName.of('T')) as PDFString).decodeText()).toBe('ApplicantEmail');
+    expect(cleanWidget.get(PDFName.of('Subj'))).toBeUndefined();
+    expect(cleanWidget.get(PDFName.of('CreationDate'))).toBeUndefined();
+    expect(cleanWidget.get(PDFName.of('M'))).toBeUndefined();
+  });
+
+  it('does not feed undecoded multi-filter [/FlateDecode /DCTDecode] image streams to inspectImage', async () => {
+    const basePdf = await buildPdfWithDeepMeta({});
+    const doc = await PDFDocument.load(basePdf, { updateMetadata: false });
+
+    const rawBytes = new Uint8Array([0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    const imgDict = PDFDict.withContext(doc.context);
+    imgDict.set(PDFName.of('Type'), PDFName.of('XObject'));
+    imgDict.set(PDFName.of('Subtype'), PDFName.of('Image'));
+    imgDict.set(PDFName.of('Width'), PDFNumber.of(2));
+    imgDict.set(PDFName.of('Height'), PDFNumber.of(2));
+    imgDict.set(PDFName.of('ColorSpace'), PDFName.of('DeviceGray'));
+    imgDict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(8));
+    imgDict.set(
+      PDFName.of('Filter'),
+      doc.context.obj([PDFName.of('FlateDecode'), PDFName.of('DCTDecode')])
+    );
+    imgDict.set(PDFName.of('Length'), PDFNumber.of(rawBytes.length));
+    const imgRef = doc.context.register(PDFRawStream.of(imgDict, rawBytes));
+    doc.getPages()[0]!.node.set(PDFName.of('Resources'), doc.context.obj({ XObject: { Im1: imgRef } }));
+
+    const pdfBytes = await doc.save({ useObjectStreams: false });
+    const report = await inspectPdf(pdfBytes);
+    expect(report.totalTags).toBe(0);
+    expect(report.embeddedImageWithMetaCount).toBe(0);
   });
 });

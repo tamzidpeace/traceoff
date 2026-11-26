@@ -1,3 +1,4 @@
+import { PDFDict, PDFDocument, PDFName, PDFNumber, PDFRawStream, PDFString } from 'pdf-lib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { detectFormat } from '../src/core/detectFormat';
 import { PdfInspectError } from '../src/core/inspector/inspectPdf';
@@ -112,7 +113,9 @@ describe('inspectFile & scrubFile', () => {
       getContext() {
         return { drawImage: drawImageSpy };
       }
-      convertToBlob = convertToBlobSpy;
+      convertToBlob(opts?: ImageEncodeOptions) {
+        return convertToBlobSpy(opts);
+      }
     }
 
     vi.stubGlobal(
@@ -249,6 +252,44 @@ describe('inspectFile & scrubFile', () => {
     expect(res.mode).toBe('lossless');
     expect(res.after.totalTags).toBe(0);
     expect(res.after.hasGps).toBe(false);
+    expect(res.after.riskLevel).toBe('clean');
+  });
+
+  it('detects and scrubs a PDF whose only metadata sits on a /Subtype /Form XObject instead of bypassing as already-clean', async () => {
+    const basePdf = await buildPdfWithDeepMeta({});
+    const doc = await PDFDocument.load(basePdf, { updateMetadata: false });
+
+    const formContent = new TextEncoder().encode('0 0 50 50 re f');
+    const formDict = PDFDict.withContext(doc.context);
+    formDict.set(PDFName.of('Type'), PDFName.of('XObject'));
+    formDict.set(PDFName.of('Subtype'), PDFName.of('Form'));
+    formDict.set(PDFName.of('BBox'), doc.context.obj([0, 0, 50, 50]));
+    formDict.set(PDFName.of('Length'), PDFNumber.of(formContent.length));
+    formDict.set(
+      PDFName.of('Metadata'),
+      doc.context.register(
+        doc.context.stream(
+          '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" dc:creator="FormAuthor"/></rdf:RDF></x:xmpmeta>',
+          { Type: 'Metadata', Subtype: 'XML' }
+        )
+      )
+    );
+    formDict.set(
+      PDFName.of('PieceInfo'),
+      doc.context.obj({ Illustrator: { LastModified: PDFString.of('D:20260101000000Z') } })
+    );
+
+    const formRef = doc.context.register(PDFRawStream.of(formDict, formContent));
+    doc.getPages()[0]!.node.set(PDFName.of('Resources'), doc.context.obj({ XObject: { Fm1: formRef } }));
+
+    const pdfBytes = await doc.save({ useObjectStreams: false });
+    const inspected = await inspectFile(pdfBytes);
+    expect(inspected.totalTags).toBeGreaterThan(0);
+
+    const res = await scrubFile(pdfBytes, DEFAULT_OPTIONS);
+    expect(res.mode).toBe('pdf-deep');
+    expect(res.before.totalTags).toBeGreaterThan(0);
+    expect(res.after.totalTags).toBe(0);
     expect(res.after.riskLevel).toBe('clean');
   });
 });
@@ -517,5 +558,32 @@ describe('ScrubWorkerClient', () => {
 
     client.dispose();
     expect(terminateSecond).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans up pending map and rejects when worker.postMessage throws synchronously', async () => {
+    class MockWorker {}
+    vi.stubGlobal('Worker', MockWorker);
+
+    const mockWorker = {
+      onmessage: null as ((ev: { data: unknown }) => void) | null,
+      onerror: null as ((ev: ErrorEvent) => void) | null,
+      onmessageerror: null as (() => void) | null,
+      postMessage: vi.fn(() => {
+        throw new Error('DataCloneError: cannot clone payload');
+      }),
+      terminate: vi.fn(),
+    };
+
+    const client = new ScrubWorkerClient(() => mockWorker as unknown as Worker);
+    const jpeg = buildJpegWithExif({ make: 'Apple' });
+
+    await expect(client.inspect(jpeg)).rejects.toThrow('DataCloneError: cannot clone payload');
+    await expect(client.scrub(jpeg, DEFAULT_OPTIONS)).rejects.toThrow(
+      'DataCloneError: cannot clone payload'
+    );
+
+    const pendingSize = (client as unknown as { pending: Map<number, unknown> }).pending.size;
+    expect(pendingSize).toBe(0);
+    client.dispose();
   });
 });

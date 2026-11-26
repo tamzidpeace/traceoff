@@ -26,7 +26,6 @@ export interface QueueItem {
   report: MetadataReport | null;
   result: ScrubResult | null;
   error: string | null;
-  signedConfirmationRequired: boolean;
   signedConfirmed: boolean;
   drawerOpen: boolean;
 }
@@ -119,7 +118,6 @@ export function useScrubQueue() {
           report: null,
           result: null,
           error: null,
-          signedConfirmationRequired: false,
           signedConfirmed: false,
           drawerOpen: false,
         };
@@ -138,10 +136,15 @@ export function useScrubQueue() {
             const current = itemsRef.current.find((item) => item.id === entry.id);
             if (!mountedRef.current || !current) return;
 
-            const previewUrl =
-              !current.previewUrl && report.format !== 'pdf'
-                ? URL.createObjectURL(current.file)
-                : current.previewUrl;
+            let previewUrl = current.previewUrl;
+            if (report.format === 'pdf') {
+              if (previewUrl) {
+                URL.revokeObjectURL(previewUrl);
+                previewUrl = null;
+              }
+            } else if (!previewUrl) {
+              previewUrl = URL.createObjectURL(current.file);
+            }
 
             itemsRef.current = itemsRef.current.map((item) =>
               item.id === entry.id
@@ -170,14 +173,19 @@ export function useScrubQueue() {
               )
             );
           } catch (err) {
-            if (!mountedRef.current || !itemsRef.current.some((item) => item.id === entry.id)) {
+            const current = itemsRef.current.find((item) => item.id === entry.id);
+            if (!mountedRef.current || !current) {
               return;
+            }
+            if (current.previewUrl) {
+              URL.revokeObjectURL(current.previewUrl);
             }
             const errorMessage = formatErrorMessage(err);
             itemsRef.current = itemsRef.current.map((item) =>
               item.id === entry.id
                 ? {
                     ...item,
+                    previewUrl: null,
                     status: 'error',
                     error: errorMessage,
                   }
@@ -188,6 +196,7 @@ export function useScrubQueue() {
                 if (item.id !== entry.id) return item;
                 return {
                   ...item,
+                  previewUrl: null,
                   status: 'error',
                   error: errorMessage,
                 };
@@ -210,14 +219,6 @@ export function useScrubQueue() {
         overrideAllowSigned || target.signedConfirmed || currentOptions.allowSignedPdfScrub;
 
       if (target.report.isSignedPdf && !allowSigned) {
-        itemsRef.current = itemsRef.current.map((item) =>
-          item.id === id ? { ...item, signedConfirmationRequired: true } : item
-        );
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === id ? { ...item, signedConfirmationRequired: true } : item
-          )
-        );
         return;
       }
 
@@ -227,7 +228,6 @@ export function useScrubQueue() {
               ...item,
               status: 'scrubbing',
               error: null,
-              signedConfirmationRequired: false,
             }
           : item
       );
@@ -238,7 +238,6 @@ export function useScrubQueue() {
                 ...item,
                 status: 'scrubbing',
                 error: null,
-                signedConfirmationRequired: false,
               }
             : item
         )
@@ -276,7 +275,6 @@ export function useScrubQueue() {
                 result,
                 cleanUrl: nextCleanUrl,
                 error: null,
-                signedConfirmationRequired: false,
               }
             : item
         );
@@ -292,7 +290,6 @@ export function useScrubQueue() {
               result,
               cleanUrl: nextCleanUrl,
               error: null,
-              signedConfirmationRequired: false,
             };
           })
         );
@@ -314,7 +311,6 @@ export function useScrubQueue() {
               ? {
                   ...item,
                   status: 'ready',
-                  signedConfirmationRequired: true,
                   signedConfirmed: false,
                 }
               : item
@@ -325,7 +321,6 @@ export function useScrubQueue() {
                 ? {
                     ...item,
                     status: 'ready',
-                    signedConfirmationRequired: true,
                     signedConfirmed: false,
                   }
                 : item
@@ -367,13 +362,13 @@ export function useScrubQueue() {
 
       itemsRef.current = itemsRef.current.map((item) =>
         item.id === id
-          ? { ...item, signedConfirmed: true, signedConfirmationRequired: false }
+          ? { ...item, signedConfirmed: true }
           : item
       );
       setItems((prev) =>
         prev.map((item) =>
           item.id === id
-            ? { ...item, signedConfirmed: true, signedConfirmationRequired: false }
+            ? { ...item, signedConfirmed: true }
             : item
         )
       );
@@ -383,13 +378,20 @@ export function useScrubQueue() {
   );
 
   const setSignedConfirmed = useCallback((id: string, confirmed: boolean) => {
+    itemsRef.current = itemsRef.current.map((item) =>
+      item.id === id
+        ? {
+            ...item,
+            signedConfirmed: confirmed,
+          }
+        : item
+    );
     setItems((prev) =>
       prev.map((item) =>
         item.id === id
           ? {
               ...item,
               signedConfirmed: confirmed,
-              signedConfirmationRequired: confirmed ? false : item.signedConfirmationRequired,
             }
           : item
       )
@@ -402,6 +404,9 @@ export function useScrubQueue() {
   }, [scrubItem]);
 
   const toggleDrawer = useCallback((id: string) => {
+    itemsRef.current = itemsRef.current.map((item) =>
+      item.id === id ? { ...item, drawerOpen: !item.drawerOpen } : item
+    );
     setItems((prev) =>
       prev.map((item) =>
         item.id === id ? { ...item, drawerOpen: !item.drawerOpen } : item
