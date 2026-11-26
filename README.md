@@ -3,9 +3,22 @@
 **100% client-side, offline-ready metadata inspector and scrubber for JPEG, PNG, WebP, and PDF files.**
 
 - **Live Demo:** https://tamzidpeace.github.io/traceoff/
+- **User Guide:** [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - **Repository:** https://github.com/tamzidpeace/traceoff
 
 TraceOff inspects and removes hidden privacy-sensitive metadata—GPS coordinates, camera/device identifiers, author names, timestamps, XMP packets, and embedded PDF image metadata—directly inside your browser using a dedicated Web Worker.
+
+---
+
+## UI Screenshots
+
+### Dropzone, Options & Batch Controls
+![TraceOff home UI with dropzone and batch options](docs/screenshots/ui-home.png)
+
+### Scrubbed File Card & Before/After Metadata Inspector
+![TraceOff Before vs. After metadata drawer](docs/screenshots/ui-before-after.png)
+
+See the full walkthrough in the **[User Guide](docs/USER_GUIDE.md)**.
 
 ---
 
