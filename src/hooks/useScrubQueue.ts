@@ -73,6 +73,7 @@ export function useScrubQueue() {
   const itemsRef = useRef<QueueItem[]>(items);
   const optionsRef = useRef<ScrubOptions>(options);
   const idCounterRef = useRef(0);
+  const mountedRef = useRef(true);
 
   itemsRef.current = items;
   optionsRef.current = options;
@@ -85,7 +86,9 @@ export function useScrubQueue() {
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       for (const item of itemsRef.current) {
         revokeItemUrls(item);
       }
@@ -122,6 +125,7 @@ export function useScrubQueue() {
         };
       });
 
+      itemsRef.current = [...itemsRef.current, ...newItems];
       setItems((prev) => [...prev, ...newItems]);
 
       await Promise.all(
@@ -131,31 +135,61 @@ export function useScrubQueue() {
             const bytes = new Uint8Array(buffer);
             const report = await getClient().inspect(bytes);
 
+            const current = itemsRef.current.find((item) => item.id === entry.id);
+            if (!mountedRef.current || !current) return;
+
+            const previewUrl =
+              !current.previewUrl && report.format !== 'pdf'
+                ? URL.createObjectURL(current.file)
+                : current.previewUrl;
+
+            itemsRef.current = itemsRef.current.map((item) =>
+              item.id === entry.id
+                ? {
+                    ...item,
+                    bytes,
+                    previewUrl,
+                    status: 'ready',
+                    report,
+                    error: null,
+                  }
+                : item
+            );
             setItems((prev) =>
-              prev.map((item) => {
-                if (item.id !== entry.id) return item;
-                let previewUrl = item.previewUrl;
-                if (!previewUrl && report.format !== 'pdf') {
-                  previewUrl = URL.createObjectURL(item.file);
-                }
-                return {
-                  ...item,
-                  bytes,
-                  previewUrl,
-                  status: 'ready',
-                  report,
-                  error: null,
-                };
-              })
+              prev.map((item) =>
+                item.id === entry.id
+                  ? {
+                      ...item,
+                      bytes,
+                      previewUrl,
+                      status: 'ready',
+                      report,
+                      error: null,
+                    }
+                  : item
+              )
             );
           } catch (err) {
+            if (!mountedRef.current || !itemsRef.current.some((item) => item.id === entry.id)) {
+              return;
+            }
+            const errorMessage = formatErrorMessage(err);
+            itemsRef.current = itemsRef.current.map((item) =>
+              item.id === entry.id
+                ? {
+                    ...item,
+                    status: 'error',
+                    error: errorMessage,
+                  }
+                : item
+            );
             setItems((prev) =>
               prev.map((item) => {
                 if (item.id !== entry.id) return item;
                 return {
                   ...item,
                   status: 'error',
-                  error: formatErrorMessage(err),
+                  error: errorMessage,
                 };
               })
             );
@@ -169,13 +203,16 @@ export function useScrubQueue() {
   const scrubItem = useCallback(
     async (id: string, overrideAllowSigned = false) => {
       const target = itemsRef.current.find((item) => item.id === id);
-      if (!target || !target.bytes || !target.report) return;
+      if (!target || !target.bytes || !target.report || target.status === 'scrubbing') return;
 
       const currentOptions = optionsRef.current;
       const allowSigned =
         overrideAllowSigned || target.signedConfirmed || currentOptions.allowSignedPdfScrub;
 
       if (target.report.isSignedPdf && !allowSigned) {
+        itemsRef.current = itemsRef.current.map((item) =>
+          item.id === id ? { ...item, signedConfirmationRequired: true } : item
+        );
         setItems((prev) =>
           prev.map((item) =>
             item.id === id ? { ...item, signedConfirmationRequired: true } : item
@@ -184,6 +221,16 @@ export function useScrubQueue() {
         return;
       }
 
+      itemsRef.current = itemsRef.current.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              status: 'scrubbing',
+              error: null,
+              signedConfirmationRequired: false,
+            }
+          : item
+      );
       setItems((prev) =>
         prev.map((item) =>
           item.id === id
@@ -203,15 +250,40 @@ export function useScrubQueue() {
           allowSignedPdfScrub: allowSigned,
         });
 
+        if (!mountedRef.current || !itemsRef.current.some((entry) => entry.id === id)) {
+          return;
+        }
+
         const cleanBlob = new Blob([new Uint8Array(result.cleanBytes)], {
           type: mimeTypeForFormat(result.format),
         });
         const nextCleanUrl = URL.createObjectURL(cleanBlob);
 
+        const currentItem = itemsRef.current.find((item) => item.id === id);
+        if (!mountedRef.current || !currentItem) {
+          URL.revokeObjectURL(nextCleanUrl);
+          return;
+        }
+        if (currentItem.cleanUrl) {
+          URL.revokeObjectURL(currentItem.cleanUrl);
+        }
+
+        itemsRef.current = itemsRef.current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                status: 'scrubbed',
+                result,
+                cleanUrl: nextCleanUrl,
+                error: null,
+                signedConfirmationRequired: false,
+              }
+            : item
+        );
         setItems((prev) =>
           prev.map((item) => {
             if (item.id !== id) return item;
-            if (item.cleanUrl) {
+            if (item.cleanUrl && item.cleanUrl !== currentItem.cleanUrl) {
               URL.revokeObjectURL(item.cleanUrl);
             }
             return {
@@ -225,6 +297,10 @@ export function useScrubQueue() {
           })
         );
       } catch (err) {
+        if (!mountedRef.current || !itemsRef.current.some((entry) => entry.id === id)) {
+          return;
+        }
+
         const isSignedErr =
           err instanceof PdfScrubError ||
           (typeof err === 'object' &&
@@ -233,6 +309,16 @@ export function useScrubQueue() {
             (err as { code?: string }).code === 'signed-confirmation-required');
 
         if (isSignedErr) {
+          itemsRef.current = itemsRef.current.map((item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  status: 'ready',
+                  signedConfirmationRequired: true,
+                  signedConfirmed: false,
+                }
+              : item
+          );
           setItems((prev) =>
             prev.map((item) =>
               item.id === id
@@ -248,13 +334,23 @@ export function useScrubQueue() {
           return;
         }
 
+        const errorMessage = formatErrorMessage(err);
+        itemsRef.current = itemsRef.current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                status: 'error',
+                error: errorMessage,
+              }
+            : item
+        );
         setItems((prev) =>
           prev.map((item) =>
             item.id === id
               ? {
                   ...item,
                   status: 'error',
-                  error: formatErrorMessage(err),
+                  error: errorMessage,
                 }
               : item
           )
@@ -266,6 +362,14 @@ export function useScrubQueue() {
 
   const confirmSignedScrub = useCallback(
     async (id: string) => {
+      const target = itemsRef.current.find((item) => item.id === id);
+      if (!target || target.status === 'scrubbing') return;
+
+      itemsRef.current = itemsRef.current.map((item) =>
+        item.id === id
+          ? { ...item, signedConfirmed: true, signedConfirmationRequired: false }
+          : item
+      );
       setItems((prev) =>
         prev.map((item) =>
           item.id === id
@@ -310,6 +414,7 @@ export function useScrubQueue() {
     if (target) {
       revokeItemUrls(target);
     }
+    itemsRef.current = itemsRef.current.filter((item) => item.id !== id);
     setItems((prev) => prev.filter((item) => item.id !== id));
   }, []);
 
@@ -317,6 +422,7 @@ export function useScrubQueue() {
     for (const item of itemsRef.current) {
       revokeItemUrls(item);
     }
+    itemsRef.current = [];
     setItems([]);
   }, []);
 

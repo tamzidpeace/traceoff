@@ -511,4 +511,173 @@ describe('TraceOff App UI', () => {
       expect(revokedUrls).toContain(url);
     }
   });
+
+  it('does not leak an unrevoked cleanUrl ObjectURL when removing or clearing a file while scrub is pending', async () => {
+    const reportOne = makeJpegReport();
+    const reportTwo = makeJpegReport();
+    mockInspect.mockResolvedValueOnce(reportOne).mockResolvedValueOnce(reportTwo);
+
+    let resolveScrubOne!: (result: ScrubResult) => void;
+    let resolveScrubTwo!: (result: ScrubResult) => void;
+    mockScrub
+      .mockImplementationOnce(
+        () =>
+          new Promise<ScrubResult>((resolve) => {
+            resolveScrubOne = resolve;
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<ScrubResult>((resolve) => {
+            resolveScrubTwo = resolve;
+          })
+      );
+
+    const { container } = render(<App />);
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: {
+        files: [
+          createTestFile('pending-remove.jpg', 'image/jpeg', 'one'),
+          createTestFile('pending-clear.jpg', 'image/jpeg', 'two'),
+        ],
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('pending-remove.jpg')).toBeInTheDocument();
+      expect(screen.getByText('pending-clear.jpg')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Scrub All Files/i }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Scrubbing locally...')).toHaveLength(2);
+    });
+
+    const urlsCreatedBeforeRemoval = createdUrls.length;
+    expect(urlsCreatedBeforeRemoval).toBe(2);
+
+    // Remove the first file while its scrub is still pending
+    fireEvent.click(screen.getByRole('button', { name: 'Remove pending-remove.jpg' }));
+    expect(screen.queryByText('pending-remove.jpg')).not.toBeInTheDocument();
+
+    // Clear the remaining file while its scrub is still pending
+    fireEvent.click(screen.getByRole('button', { name: /Clear All/i }));
+    expect(screen.queryByText('pending-clear.jpg')).not.toBeInTheDocument();
+
+    // Now both pending scrubs resolve
+    resolveScrubOne({
+      format: 'jpeg',
+      cleanBytes: new Uint8Array([1, 2, 3]),
+      mode: 'lossless',
+      before: reportOne,
+      after: makeCleanReport('jpeg'),
+      originalSize: 1000,
+      cleanSize: 800,
+      warnings: [],
+    });
+    resolveScrubTwo({
+      format: 'jpeg',
+      cleanBytes: new Uint8Array([4, 5, 6]),
+      mode: 'lossless',
+      before: reportTwo,
+      after: makeCleanReport('jpeg'),
+      originalSize: 1000,
+      cleanSize: 800,
+      warnings: [],
+    });
+
+    await waitFor(() => {
+      expect(mockScrub).toHaveBeenCalledTimes(2);
+    });
+    // Flush any remaining microtasks from the resolved scrub promises
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // No cleanUrl ObjectURL was created after removal/clear, and every created URL was revoked
+    expect(createdUrls).toHaveLength(urlsCreatedBeforeRemoval);
+    for (const url of createdUrls) {
+      expect(revokedUrls).toContain(url);
+    }
+    expect(new Set(revokedUrls)).toEqual(new Set(createdUrls));
+  });
+
+  it('disables "Confirm & Scrub Signed PDF" while scrubbing and prevents concurrent scrub calls', async () => {
+    const signedPdfReport: MetadataReport = {
+      format: 'pdf',
+      riskLevel: 'medium',
+      hasGps: false,
+      orientation: null,
+      hasIccProfile: false,
+      isSignedPdf: true,
+      embeddedImageWithMetaCount: 0,
+      totalTags: 1,
+      fields: [
+        {
+          key: 'Author',
+          label: 'Author',
+          value: 'Bob',
+          category: 'author',
+          sensitive: true,
+        },
+      ],
+    };
+
+    let resolveSignedScrub!: (result: ScrubResult) => void;
+    mockInspect.mockResolvedValueOnce(signedPdfReport);
+    mockScrub.mockImplementationOnce(
+      () =>
+        new Promise<ScrubResult>((resolve) => {
+          resolveSignedScrub = resolve;
+        })
+    );
+
+    const { container } = render(<App />);
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [createTestFile('signed-inflight.pdf', 'application/pdf', '%PDF-1.7')] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('signed-inflight.pdf')).toBeInTheDocument();
+      expect(screen.getByText(/Digitally signed PDF/i)).toBeInTheDocument();
+    });
+
+    const confirmBtn = screen.getByRole('button', { name: /Confirm & Scrub Signed PDF/i });
+    const confirmCheckbox = screen.getByRole('checkbox', {
+      name: /I understand scrubbing will invalidate the digital signature/i,
+    });
+    expect(confirmBtn).toBeEnabled();
+
+    fireEvent.click(confirmBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText('Scrubbing locally...')).toBeInTheDocument();
+    });
+
+    expect(confirmBtn).toBeDisabled();
+    expect(confirmCheckbox).toBeDisabled();
+    expect(mockScrub).toHaveBeenCalledTimes(1);
+
+    // Attempting to click again while scrubbing must not trigger a concurrent scrub call
+    fireEvent.click(confirmBtn);
+    expect(mockScrub).toHaveBeenCalledTimes(1);
+
+    resolveSignedScrub({
+      format: 'pdf',
+      cleanBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      mode: 'pdf-deep',
+      before: signedPdfReport,
+      after: makeCleanReport('pdf'),
+      originalSize: 2000,
+      cleanSize: 1600,
+      warnings: ['Digital signature fields were removed/invalidated during scrubbing.'],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Verified Clean: 0 tracking tags remaining')).toBeInTheDocument();
+    });
+    expect(mockScrub).toHaveBeenCalledTimes(1);
+  });
 });

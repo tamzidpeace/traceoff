@@ -246,8 +246,9 @@ export function FileCard({
               <input
                 type="checkbox"
                 checked={item.signedConfirmed}
+                disabled={item.status === 'scrubbing'}
                 onChange={(e) => onToggleSignedConfirmed(item.id, e.target.checked)}
-                className="h-3.5 w-3.5 rounded border-amber-500/50 text-amber-600 focus:ring-amber-500"
+                className="h-3.5 w-3.5 rounded border-amber-500/50 text-amber-600 focus:ring-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
               />
               <span>I understand scrubbing will invalidate the digital signature</span>
             </label>
@@ -255,8 +256,9 @@ export function FileCard({
 
           <button
             type="button"
+            disabled={item.status === 'scrubbing'}
             onClick={() => onConfirmSignedScrub(item.id)}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-amber-500"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <span>Confirm &amp; Scrub Signed PDF</span>
           </button>
