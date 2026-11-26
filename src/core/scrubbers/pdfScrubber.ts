@@ -145,6 +145,16 @@ function sanitizeAnnotation(
   }
 }
 
+function isXObjectStream(doc: PDFDocument, stream: PDFStream): boolean {
+  const subtype = doc.context.lookup(stream.dict.get(PDFName.of('Subtype')));
+  const type = doc.context.lookup(stream.dict.get(PDFName.of('Type')));
+  return (
+    subtype === PDFName.of('Image') ||
+    subtype === PDFName.of('Form') ||
+    type === PDFName.of('XObject')
+  );
+}
+
 function isSingleDctDecodeFilter(doc: PDFDocument, dict: PDFDict): boolean {
   const filter = doc.context.lookup(dict.get(PDFName.of('Filter')));
   if (filter === PDFName.of('DCTDecode')) {
@@ -220,27 +230,40 @@ export async function scrubPdfDeep(
     }
   }
 
-  // 4. Strip /Metadata & /PieceInfo on image XObjects and losslessly scrub /DCTDecode JPEGs
-  const imageStreams: Array<[PDFRef, PDFStream]> = [];
+  // 4. Strip /Metadata & /PieceInfo on all XObjects (Image, Form, etc.) and losslessly scrub /DCTDecode JPEGs
+  const xobjectStreams: Array<[PDFRef, PDFStream]> = [];
   for (const [ref, obj] of doc.context.enumerateIndirectObjects()) {
-    if (obj instanceof PDFStream && obj.dict.get(PDFName.of('Subtype')) === PDFName.of('Image')) {
-      imageStreams.push([ref, obj]);
+    if (obj instanceof PDFStream && isXObjectStream(doc, obj)) {
+      xobjectStreams.push([ref, obj]);
     }
   }
 
-  for (const [ref, stream] of imageStreams) {
+  let jpegStreamIndex = 0;
+  for (const [ref, stream] of xobjectStreams) {
     stripDictMetadataAndPieceInfo(doc, stream.dict);
 
-    if (stream instanceof PDFRawStream && isSingleDctDecodeFilter(doc, stream.dict)) {
-      const scrubbedBytes = scrubJpegLossless(stream.getContents(), {
-        preserveIcc: options.preserveIcc,
-      });
-      const newDict = PDFDict.withContext(doc.context);
-      for (const [key, val] of stream.dict.entries()) {
-        newDict.set(key, val);
+    const subtype = doc.context.lookup(stream.dict.get(PDFName.of('Subtype')));
+    if (
+      subtype === PDFName.of('Image') &&
+      stream instanceof PDFRawStream &&
+      isSingleDctDecodeFilter(doc, stream.dict)
+    ) {
+      jpegStreamIndex++;
+      try {
+        const scrubbedBytes = scrubJpegLossless(stream.getContents(), {
+          preserveIcc: options.preserveIcc,
+        });
+        const newDict = PDFDict.withContext(doc.context);
+        for (const [key, val] of stream.dict.entries()) {
+          newDict.set(key, val);
+        }
+        newDict.set(PDFName.of('Length'), PDFNumber.of(scrubbedBytes.length));
+        doc.context.assign(ref, PDFRawStream.of(newDict, scrubbedBytes));
+      } catch {
+        warnings.push(
+          `Could not scrub embedded JPEG stream #${jpegStreamIndex} (non-standard or abbreviated JPEG encoding); stream preserved.`
+        );
       }
-      newDict.set(PDFName.of('Length'), PDFNumber.of(scrubbedBytes.length));
-      doc.context.assign(ref, PDFRawStream.of(newDict, scrubbedBytes));
     }
   }
 

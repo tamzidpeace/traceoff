@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PDFArray, PDFDict, PDFDocument, PDFName, PDFRawStream, PDFString } from 'pdf-lib';
+import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFRawStream, PDFString } from 'pdf-lib';
 import { inspectImage } from '../src/core/inspector/inspectImage';
 import { inspectPdf, PdfInspectError } from '../src/core/inspector/inspectPdf';
 import { PdfScrubError, scrubPdfDeep } from '../src/core/scrubbers/pdfScrubber';
@@ -303,5 +303,99 @@ describe('scrubPdfDeep', () => {
     ).rejects.toMatchObject({
       code: 'invalid',
     });
+  });
+
+  it('preserves malformed or abbreviated /DCTDecode stream with warning instead of aborting scrub', async () => {
+    const basePdf = await buildPdfWithDeepMeta({ author: 'Alice' });
+    const doc = await PDFDocument.load(basePdf, { updateMetadata: false });
+
+    const abbreviatedJpeg = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+    const imgDict = PDFDict.withContext(doc.context);
+    imgDict.set(PDFName.of('Type'), PDFName.of('XObject'));
+    imgDict.set(PDFName.of('Subtype'), PDFName.of('Image'));
+    imgDict.set(PDFName.of('Width'), PDFNumber.of(2));
+    imgDict.set(PDFName.of('Height'), PDFNumber.of(2));
+    imgDict.set(PDFName.of('ColorSpace'), PDFName.of('DeviceGray'));
+    imgDict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(8));
+    imgDict.set(PDFName.of('Filter'), PDFName.of('DCTDecode'));
+    imgDict.set(PDFName.of('Length'), PDFNumber.of(abbreviatedJpeg.length));
+    const imgRef = doc.context.register(PDFRawStream.of(imgDict, abbreviatedJpeg));
+
+    const page = doc.getPages()[0]!;
+    const resources = doc.context.obj({ XObject: { Im1: imgRef } });
+    page.node.set(PDFName.of('Resources'), resources);
+
+    const pdfBytes = await doc.save({ useObjectStreams: false });
+
+    const { cleanBytes, warnings } = await scrubPdfDeep(pdfBytes, {
+      preserveIcc: true,
+      allowSignedPdfScrub: false,
+    });
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/embedded JPEG stream #1/i);
+    expect(warnings[0]).toMatch(/preserved/i);
+
+    const cleanDoc = await PDFDocument.load(cleanBytes, { updateMetadata: false });
+    expect(cleanDoc.context.trailerInfo.Info).toBeUndefined();
+    const preservedStreams = findEmbeddedJpegStreams(cleanDoc);
+    expect(preservedStreams).toHaveLength(1);
+    expect(Array.from(preservedStreams[0]!.getContents())).toEqual([0x01, 0x02, 0x03, 0x04]);
+  });
+
+  it('deletes /Metadata and /PieceInfo from /Subtype /Form XObjects', async () => {
+    const basePdf = await buildPdfWithDeepMeta({});
+    const doc = await PDFDocument.load(basePdf, { updateMetadata: false });
+
+    const formContent = new TextEncoder().encode('0 0 100 100 re f');
+    const formDict = PDFDict.withContext(doc.context);
+    formDict.set(PDFName.of('Type'), PDFName.of('XObject'));
+    formDict.set(PDFName.of('Subtype'), PDFName.of('Form'));
+    formDict.set(PDFName.of('BBox'), doc.context.obj([0, 0, 100, 100]));
+    formDict.set(PDFName.of('Length'), PDFNumber.of(formContent.length));
+    formDict.set(
+      PDFName.of('Metadata'),
+      doc.context.register(
+        doc.context.stream(
+          '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" dc:creator="IllustratorUser"/></rdf:RDF></x:xmpmeta>',
+          { Type: 'Metadata', Subtype: 'XML' }
+        )
+      )
+    );
+    formDict.set(
+      PDFName.of('PieceInfo'),
+      doc.context.obj({ Illustrator: { LastModified: PDFString.of('D:20260101000000Z') } })
+    );
+    const formRef = doc.context.register(PDFRawStream.of(formDict, formContent));
+
+    const page = doc.getPages()[0]!;
+    page.node.set(PDFName.of('Resources'), doc.context.obj({ XObject: { Fm1: formRef } }));
+
+    const pdfBytes = await doc.save({ useObjectStreams: false });
+
+    const { cleanBytes, warnings } = await scrubPdfDeep(pdfBytes, {
+      preserveIcc: true,
+      allowSignedPdfScrub: false,
+    });
+    expect(warnings).toEqual([]);
+
+    const report = await inspectPdf(cleanBytes);
+    expect(report.totalTags).toBe(0);
+    expect(report.riskLevel).toBe('clean');
+
+    const cleanDoc = await PDFDocument.load(cleanBytes, { updateMetadata: false });
+    const formStreams: PDFRawStream[] = [];
+    for (const [, obj] of cleanDoc.context.enumerateIndirectObjects()) {
+      if (
+        obj instanceof PDFRawStream &&
+        obj.dict.get(PDFName.of('Subtype')) === PDFName.of('Form')
+      ) {
+        formStreams.push(obj);
+      }
+    }
+    expect(formStreams).toHaveLength(1);
+    expect(formStreams[0]!.dict.get(PDFName.of('Metadata'))).toBeUndefined();
+    expect(formStreams[0]!.dict.get(PDFName.of('PieceInfo'))).toBeUndefined();
+    expect(formStreams[0]!.dict.get(PDFName.of('BBox'))).toBeDefined();
   });
 });
