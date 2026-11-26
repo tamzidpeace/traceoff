@@ -19,6 +19,7 @@ import {
   deduplicateFields,
   extractXmpFields,
   formatTagLabel,
+  hasGpsField,
 } from './shared';
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
@@ -380,6 +381,7 @@ export async function inspectPdf(bytes: Uint8Array): Promise<MetadataReport> {
   }
 
   const deduped = deduplicateFields(fields);
+  hasGps = hasGps || hasGpsField(deduped);
   const totalTags = deduped.length;
 
   return {

@@ -8,6 +8,7 @@ import {
   extractXmpFields,
   formatMetadataValue,
   formatTagLabel,
+  hasGpsField,
 } from './shared';
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
@@ -229,16 +230,62 @@ function findZeroByte(bytes: Uint8Array, start: number): number {
   return -1;
 }
 
-function scanPngChunksFallback(bytes: Uint8Array): {
+async function parseRawExifChunk(
+  payload: Uint8Array,
+  fallbackKey: string
+): Promise<{
   fields: MetadataField[];
+  hasGps: boolean;
+  orientation: number | null;
+}> {
+  const tiffSlice = startsWithAscii(payload, 0, 'Exif\0\0')
+    ? payload.subarray(6)
+    : payload;
+  try {
+    const parsed = (await exifr.parse(tiffSlice, EXIFR_OPTIONS)) as
+      | Record<string, unknown>
+      | undefined;
+    const extracted = extractExifrFields(parsed);
+    if (extracted.fields.length > 0) {
+      return {
+        fields: extracted.fields,
+        hasGps: extracted.hasGps,
+        orientation: extracted.orientation,
+      };
+    }
+  } catch {
+    // Fall through to raw chunk fallback below
+  }
+
+  return {
+    fields: [
+      {
+        key: fallbackKey,
+        label: 'Raw EXIF Chunk',
+        value: `${payload.length} bytes`,
+        category: 'other',
+        sensitive: true,
+      },
+    ],
+    hasGps: false,
+    orientation: null,
+  };
+}
+
+async function scanPngChunksFallback(bytes: Uint8Array): Promise<{
+  fields: MetadataField[];
+  hasGps: boolean;
+  orientation: number | null;
   hasIccProfile: boolean;
-} {
+}> {
   const fields: MetadataField[] = [];
+  let hasGps = false;
+  let orientation: number | null = null;
   let hasIccProfile = false;
 
   const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   if (bytes.length < 8 || PNG_SIG.some((b, i) => bytes[i] !== b)) {
-    return { fields, hasIccProfile };
+    return { fields, hasGps, orientation, hasIccProfile };
   }
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -255,6 +302,13 @@ function scanPngChunksFallback(bytes: Uint8Array): {
 
     if (type === 'iCCP') {
       hasIccProfile = true;
+    } else if (type === 'eXIf') {
+      const exifParsed = await parseRawExifChunk(data, 'eXIf');
+      fields.push(...exifParsed.fields);
+      hasGps = hasGps || exifParsed.hasGps;
+      if (orientation === null && exifParsed.orientation !== null) {
+        orientation = exifParsed.orientation;
+      }
     } else if (type === 'tEXt') {
       const nul = findZeroByte(data, 0);
       if (nul > 0) {
@@ -351,7 +405,7 @@ function scanPngChunksFallback(bytes: Uint8Array): {
     offset = dataEnd + 4;
   }
 
-  return { fields, hasIccProfile };
+  return { fields, hasGps, orientation, hasIccProfile };
 }
 
 async function inspectWebp(bytes: Uint8Array): Promise<{
@@ -388,27 +442,11 @@ async function inspectWebp(bytes: Uint8Array): Promise<{
     if (fourcc === 'ICCP') {
       hasIccProfile = true;
     } else if (fourcc === 'EXIF') {
-      const tiffSlice = startsWithAscii(payload, 0, 'Exif\0\0')
-        ? payload.subarray(6)
-        : payload;
-      try {
-        const parsed = (await exifr.parse(tiffSlice, EXIFR_OPTIONS)) as
-          | Record<string, unknown>
-          | undefined;
-        const extracted = extractExifrFields(parsed);
-        fields.push(...extracted.fields);
-        hasGps = hasGps || extracted.hasGps;
-        if (orientation === null && extracted.orientation !== null) {
-          orientation = extracted.orientation;
-        }
-      } catch {
-        fields.push({
-          key: 'EXIF',
-          label: 'Raw EXIF Chunk',
-          value: `${payload.length} bytes`,
-          category: 'other',
-          sensitive: true,
-        });
+      const exifParsed = await parseRawExifChunk(payload, 'EXIF');
+      fields.push(...exifParsed.fields);
+      hasGps = hasGps || exifParsed.hasGps;
+      if (orientation === null && exifParsed.orientation !== null) {
+        orientation = exifParsed.orientation;
       }
     } else if (fourcc === 'XMP ') {
       const xml = utf8Decoder.decode(payload).replace(/\0+$/, '');
@@ -461,13 +499,18 @@ export async function inspectImage(
       allFields.push(...jpegFallback.fields);
       hasIccProfile = hasIccProfile || jpegFallback.hasIccProfile;
     } else if (format === 'png') {
-      const pngFallback = scanPngChunksFallback(bytes);
+      const pngFallback = await scanPngChunksFallback(bytes);
       allFields.push(...pngFallback.fields);
+      hasGps = hasGps || pngFallback.hasGps;
+      if (orientation === null && pngFallback.orientation !== null) {
+        orientation = pngFallback.orientation;
+      }
       hasIccProfile = hasIccProfile || pngFallback.hasIccProfile;
     }
   }
 
   const fields = deduplicateFields(allFields);
+  hasGps = hasGps || hasGpsField(fields);
   const totalTags = fields.length;
 
   return {

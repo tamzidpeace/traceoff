@@ -122,6 +122,36 @@ describe('inspectImage', () => {
     expect(iccOnlyReport.totalTags).toBe(0);
     expect(iccOnlyReport.riskLevel).toBe('clean');
   });
+
+  it('falls back to PNG eXIf chunk scanning when eXIf has Exif\\0\\0 prefix', async () => {
+    const tiff = buildMinimalExifTiff({ gps: [23.8103, 90.4125], make: 'Nikon' });
+    const prefixed = new Uint8Array(6 + tiff.length);
+    prefixed.set(new TextEncoder().encode('Exif\0\0'), 0);
+    prefixed.set(tiff, 6);
+
+    const pngBase = buildPngWithMeta({ text: { Comment: 'test' } });
+    const ihdrEnd = 8 + 4 + 4 + 13 + 4; // sig + IHDR
+    const typeAndData = new Uint8Array(4 + prefixed.length);
+    typeAndData.set(new TextEncoder().encode('eXIf'), 0);
+    typeAndData.set(prefixed, 4);
+    const { crc32 } = await import('./helpers/fixtures');
+    const c = crc32(typeAndData);
+    const chunk = new Uint8Array(12 + prefixed.length);
+    const dv = new DataView(chunk.buffer);
+    dv.setUint32(0, prefixed.length, false);
+    chunk.set(typeAndData, 4);
+    dv.setUint32(8 + prefixed.length, c, false);
+
+    const pngWithPrefixedExif = new Uint8Array(pngBase.length + chunk.length);
+    pngWithPrefixedExif.set(pngBase.subarray(0, ihdrEnd), 0);
+    pngWithPrefixedExif.set(chunk, ihdrEnd);
+    pngWithPrefixedExif.set(pngBase.subarray(ihdrEnd), ihdrEnd + chunk.length);
+
+    const report = await inspectImage(pngWithPrefixedExif, 'png');
+    expect(report.hasGps).toBe(true);
+    expect(report.riskLevel).toBe('high');
+    expect(report.fields.some((f) => f.value.includes('Nikon'))).toBe(true);
+  });
 });
 
 describe('inspectPdf', () => {
@@ -204,5 +234,46 @@ describe('inspectPdf', () => {
     await expect(inspectPdf(invalid)).rejects.toMatchObject({
       code: 'invalid',
     });
+  });
+
+  it('extracts standard nested RDF XMP elements (dc:creator/rdf:Seq/rdf:li) and raises hasGps on XMP-only GPS', async () => {
+    const rdfXmp = [
+      '<x:xmpmeta xmlns:x="adobe:ns:meta/">',
+      '  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">',
+      '    <rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:exif="http://ns.adobe.com/exif/1.0/">',
+      '      <dc:creator><rdf:Seq><rdf:li>Tamzid Peace</rdf:li></rdf:Seq></dc:creator>',
+      '      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">Secret Draft</rdf:li></rdf:Alt></dc:title>',
+      '      <exif:GPSLatitude>23,48.618N</exif:GPSLatitude>',
+      '      <exif:GPSLongitude>90,24.750E</exif:GPSLongitude>',
+      '    </rdf:Description>',
+      '  </rdf:RDF>',
+      '</x:xmpmeta>',
+    ].join('\n');
+
+    const pdf = await buildPdfWithDeepMeta({ xmp: rdfXmp });
+    const pdfReport = await inspectPdf(pdf);
+
+    expect(pdfReport.hasGps).toBe(true);
+    expect(pdfReport.riskLevel).toBe('high');
+    expect(
+      pdfReport.fields.some(
+        (f) => f.key.includes('dc:creator') && f.value.includes('Tamzid Peace')
+      )
+    ).toBe(true);
+    expect(
+      pdfReport.fields.some(
+        (f) => f.key.includes('dc:title') && f.value.includes('Secret Draft')
+      )
+    ).toBe(true);
+
+    const webp = buildWebpWithMeta({ xmp: rdfXmp });
+    const webpReport = await inspectImage(webp, 'webp');
+    expect(webpReport.hasGps).toBe(true);
+    expect(webpReport.riskLevel).toBe('high');
+    expect(
+      webpReport.fields.some(
+        (f) => f.key === 'xmp:dc:creator' && f.value === 'Tamzid Peace'
+      )
+    ).toBe(true);
   });
 });
