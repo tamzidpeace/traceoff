@@ -464,4 +464,58 @@ describe('ScrubWorkerClient', () => {
       (globalThis as { onmessage?: unknown }).onmessage = origOnMessage;
     }
   });
+
+  it('terminates crashed worker on onerror and spawns a fresh worker on subsequent calls', async () => {
+    const terminateFirst = vi.fn();
+    const terminateSecond = vi.fn();
+    let createdCount = 0;
+
+    class MockWorker {}
+    vi.stubGlobal('Worker', MockWorker);
+
+    const worker1 = {
+      onmessage: null as ((ev: { data: unknown }) => void) | null,
+      onerror: null as ((ev: ErrorEvent) => void) | null,
+      onmessageerror: null as (() => void) | null,
+      postMessage: vi.fn(() => {
+        queueMicrotask(() => {
+          worker1.onerror?.({ message: 'Worker crashed fatally' } as ErrorEvent);
+        });
+      }),
+      terminate: terminateFirst,
+    };
+
+    const worker2 = {
+      onmessage: null as ((ev: { data: unknown }) => void) | null,
+      onerror: null as ((ev: ErrorEvent) => void) | null,
+      onmessageerror: null as (() => void) | null,
+      postMessage: vi.fn((payload: Record<string, unknown>) => {
+        const id = payload.id as number;
+        const bytes = payload.bytes as Uint8Array;
+        queueMicrotask(async () => {
+          const report = await inspectFile(bytes);
+          worker2.onmessage?.({ data: { id, type: 'inspect-result', report } });
+        });
+      }),
+      terminate: terminateSecond,
+    };
+
+    const factory = vi.fn(() => {
+      createdCount++;
+      return (createdCount === 1 ? worker1 : worker2) as unknown as Worker;
+    });
+
+    const client = new ScrubWorkerClient(factory);
+    const jpeg = buildJpegWithExif({ gps: [23.8103, 90.4125], make: 'Apple' });
+
+    await expect(client.inspect(jpeg)).rejects.toThrow('Worker crashed fatally');
+    expect(terminateFirst).toHaveBeenCalledTimes(1);
+
+    const report = await client.inspect(jpeg);
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(report.hasGps).toBe(true);
+
+    client.dispose();
+    expect(terminateSecond).toHaveBeenCalledTimes(1);
+  });
 });

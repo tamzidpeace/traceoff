@@ -99,9 +99,16 @@ export class ScrubWorkerClient {
           });
 
       worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+        if (this.disposed) return;
         void this.handleMessage(event.data);
       };
       worker.onerror = (event: ErrorEvent) => {
+        if (!this.disposed) {
+          worker.terminate?.();
+          if (this.worker === worker) {
+            this.worker = null;
+          }
+        }
         const message = event?.message || 'Scrub worker encountered an unexpected error';
         this.rejectAllPending(new Error(message));
       };
